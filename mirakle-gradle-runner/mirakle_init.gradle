@@ -1,0 +1,23 @@
+initscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'io.github.adambl4:mirakle:1.4.3'
+    }
+}
+ 
+apply plugin: Mirakle
+ 
+rootProject {
+    mirakle {
+        host "mirakle"
+        rsyncToRemoteArgs += ["-avzhP", "--no-p", "--exclude='.git'", "--exclude='.gradle'"]
+        rsyncFromRemoteArgs += ["-avzhP", "--no-p", "--exclude='.git'", "--exclude='.gradle'"]
+        rsyncFromRemoteArgs += ["-q", "-i", "-v", "--progress"]
+        breakOnTasks += ["package"]
+        excludeRemote += ["build/tmp", "build/generated", "build/intermediates/*", "build/kotlin"]
+        downloadInParallel true
+        downloadInterval 5000
+    }
+}
