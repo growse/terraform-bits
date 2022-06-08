@@ -16,8 +16,8 @@ module "vpc" {
   create_database_subnet_group       = true
   create_database_subnet_route_table = true
 
-manage_default_security_group = true
-default_security_group_name = "Default sg"
+  manage_default_security_group = true
+  default_security_group_name   = "Default sg"
 
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -57,6 +57,17 @@ module "alb" {
       backend_protocol = "HTTP"
       backend_port     = var.container_port
       target_type      = "ip"
+      health_check = {
+        enabled             = true
+        interval            = 30
+        path                = "/healthz"
+        port                = "traffic-port"
+        healthy_threshold   = 2
+        unhealthy_threshold = 3
+        timeout             = 5
+        protocol            = "HTTP"
+        matcher             = "200"
+      }
       targets = {
       }
     }
@@ -113,9 +124,9 @@ module "vpc_endpoints" {
   }
 }
 
-module "ecs_sg" {
+module "ecs_sg_inbound" {
   source              = "terraform-aws-modules/security-group/aws"
-  name                = "ECS container security group"
+  name                = "ECS container security group inbound"
   vpc_id              = module.vpc.vpc_id
   ingress_cidr_blocks = module.vpc.public_subnets_cidr_blocks
   // ECS should allow traffic in on the container port
@@ -124,28 +135,32 @@ module "ecs_sg" {
       to_port     = var.container_port
       from_port   = var.container_port
       protocol    = "tcp"
-      description = "Container port"
+      description = "Container port ${var.container_port}"
     }
   ]
+}
+
+module "ecs_sg_outbound_to_s3" {
+  source = "terraform-aws-modules/security-group/aws"
+  name   = "ECS container security group outbound to VPC endpoints"
+  vpc_id = module.vpc.vpc_id
   egress_prefix_list_ids = [
     module.vpc_endpoints.endpoints.s3.prefix_list_id,
-
-
   ]
   // ECS needs to be able to access things on the private subnet over port 443
   egress_cidr_blocks      = module.vpc.private_subnets_cidr_blocks
   egress_ipv6_cidr_blocks = []
   egress_rules            = ["https-443-tcp"]
-  # egress_with_cidr_blocks = [
-  #   {
-  #     to_port     = 443
-  #     from_port   = 443
-  #     protocol    = "tcp"
-  #     description = "access to VPC Endpoints from ECS container"
-  #   }
-  # ]
 }
 
+module "ecs_sg_outbound_to_rds" {
+  source                  = "terraform-aws-modules/security-group/aws"
+  name                    = "ECS container security group outbound to RDS"
+  vpc_id                  = module.vpc.vpc_id
+  egress_cidr_blocks      = module.vpc.database_subnets_cidr_blocks
+  egress_ipv6_cidr_blocks = []
+  egress_rules            = ["postgresql-tcp"]
+}
 module "ecs" {
   source             = "terraform-aws-modules/ecs/aws"
   name               = "test-cluster"
@@ -163,7 +178,7 @@ resource "aws_ecs_task_definition" "simple-web" {
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
-  task_role_arn            = aws_iam_role.ecs-task-role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
   cpu                      = 1024
   memory                   = 2048
   container_definitions = jsonencode([
@@ -175,12 +190,11 @@ resource "aws_ecs_task_definition" "simple-web" {
       essential              = true
       readonlyRootFilesystem = false
       environment = [
-        { "name" : "databaseHost", "value" : "test" },
-        # { "name" : "DATABASE_HOST", "value" : "${module.rds_postgres.db_instance_address}" },
-        # { "name" : "DATABASE_PORT", "value" : "${tostring(module.rds_postgres.db_instance_port)}" },
-        # { "name" : "DATABASE_USERNAME", "value" : "${tostring(module.rds_postgres.db_instance_username)}" },
-        # { "name" : "DATABASE_PASSWORD", "value" : "${tostring(module.rds_postgres.db_instance_password)}" },
-        # { "name" : "DATABASE_NAME", "value" : "${tostring(module.rds_postgres.db_instance_name)}" },
+        { "name" : "DATABASE_HOST", "value" : "${module.rds_postgres.db_instance_address}" },
+        { "name" : "DATABASE_PORT", "value" : "${tostring(module.rds_postgres.db_instance_port)}" },
+        { "name" : "DATABASE_USERNAME", "value" : "${tostring(module.rds_postgres.db_instance_username)}" },
+        { "name" : "DATABASE_PASSWORD", "value" : "${tostring(module.rds_postgres.db_instance_password)}" },
+        { "name" : "DATABASE_NAME", "value" : "${tostring(module.rds_postgres.db_instance_name)}" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -219,7 +233,11 @@ resource "aws_ecs_service" "simple-web" {
   }
 
   network_configuration {
-    security_groups  = [module.ecs_sg.security_group_id]
+    security_groups = [
+      module.ecs_sg_inbound.security_group_id,
+      module.ecs_sg_outbound_to_rds.security_group_id,
+      module.ecs_sg_outbound_to_s3.security_group_id
+    ]
     subnets          = module.vpc.private_subnets
     assign_public_ip = false
   }
@@ -251,72 +269,72 @@ module "ecr" {
   })
 }
 
-# module "rds_sg" {
-#   source  = "terraform-aws-modules/security-group/aws"
-#   version = "~> 4.0"
+module "rds_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "~> 4.0"
 
-#   name        = "test rds-security-group"
-#   description = "Complete PostgreSQL example security group"
-#   vpc_id      = module.vpc.vpc_id
+  name        = "Test RDS SG"
+  description = "Complete PostgreSQL example security group"
+  vpc_id      = module.vpc.vpc_id
 
-#   # ingress
-#   ingress_with_cidr_blocks = [
-#     {
-#       from_port   = 5432
-#       to_port     = 5432
-#       protocol    = "tcp"
-#       description = "PostgreSQL access from within VPC"
-#       cidr_blocks = module.vpc.vpc_cidr_block
-#     },
-#   ]
-# }
+  # ingress
+  ingress_with_cidr_blocks = [
+    {
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      description = "PostgreSQL access from within VPC"
+      cidr_blocks = module.vpc.vpc_cidr_block
+    },
+  ]
+}
 
-# module "rds_postgres" {
-#   source     = "terraform-aws-modules/rds/aws"
-#   identifier = "rd-test"
+module "rds_postgres" {
+  source     = "terraform-aws-modules/rds/aws"
+  identifier = "rd-test"
 
-#   # All available versions: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html#PostgreSQL.Concepts
-#   engine               = "postgres"
-#   engine_version       = "14.2"
-#   family               = "postgres14" # DB parameter group
-#   major_engine_version = "14"         # DB option group
-#   instance_class       = "db.t3.micro"
+  # All available versions: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html#PostgreSQL.Concepts
+  engine               = "postgres"
+  engine_version       = "14.2"
+  family               = "postgres14" # DB parameter group
+  major_engine_version = "14"         # DB option group
+  instance_class       = "db.t3.micro"
 
-#   allocated_storage     = 20
-#   max_allocated_storage = 30
+  allocated_storage     = 20
+  max_allocated_storage = 30
 
-#   # NOTE: Do NOT use 'user' as the value for 'username' as it throws:
-#   # "Error creating DB Instance: InvalidParameterValue: MasterUsername
-#   # user cannot be used as it is a reserved word used by the engine"
-#   db_name  = "testDatabase"
-#   username = "testUser"
-#   port     = 5432
+  # NOTE: Do NOT use 'user' as the value for 'username' as it throws:
+  # "Error creating DB Instance: InvalidParameterValue: MasterUsername
+  # user cannot be used as it is a reserved word used by the engine"
+  db_name  = "testDatabase"
+  username = "testUser"
+  port     = 5432
 
-#   multi_az               = true
-#   db_subnet_group_name   = module.vpc.database_subnet_group
-#   vpc_security_group_ids = [module.rds_sg.security_group_id]
+  multi_az               = true
+  db_subnet_group_name   = module.vpc.database_subnet_group
+  vpc_security_group_ids = [module.rds_sg.security_group_id]
 
-#   maintenance_window              = "Mon:00:00-Mon:03:00"
-#   backup_window                   = "03:00-06:00"
-#   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
-#   create_cloudwatch_log_group     = true
+  maintenance_window              = "Mon:00:00-Mon:03:00"
+  backup_window                   = "03:00-06:00"
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  create_cloudwatch_log_group     = true
 
-#   backup_retention_period = 0
-#   skip_final_snapshot     = true
-#   deletion_protection     = false
+  backup_retention_period = 0
+  skip_final_snapshot     = true
+  deletion_protection     = false
 
-#   performance_insights_enabled          = false
-#   performance_insights_retention_period = 1
-#   create_monitoring_role                = true
-#   monitoring_interval                   = 60
-#   monitoring_role_name                  = "example-monitoring-role-name"
-#   monitoring_role_description           = "Description for monitoring role"
-# }
+  performance_insights_enabled          = false
+  performance_insights_retention_period = 1
+  create_monitoring_role                = true
+  monitoring_interval                   = 60
+  monitoring_role_name                  = "example-monitoring-role-name"
+  monitoring_role_description           = "Description for monitoring role"
+}
 
 
 // A role for the fargate task execution
 resource "aws_iam_role" "ecs_task_execution_role" {
-  name               = "test-ecs_task_execution_role"
+  name               = "test-ecs-task-execution-role"
   assume_role_policy = file("iam-ecs-assumerole-policy.json")
 }
 
@@ -326,14 +344,14 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy_attach
 }
 
 // A role that the task will run as
-resource "aws_iam_role" "ecs-task-role" {
+resource "aws_iam_role" "ecs_task_role" {
   name               = "test-ecs-task-role"
   assume_role_policy = file("iam-ecs-assumerole-policy.json")
 }
 
 // The policy for the ECS task role
-resource "aws_iam_policy" "ecs-task-role-policy" {
-  name        = "test-ecs-task-policy"
+resource "aws_iam_policy" "ecs_task_role_policy" {
+  name        = "test-ecs-task-role-policy"
   description = "Policy that allows access to some things"
 
   policy = jsonencode({
@@ -342,7 +360,7 @@ resource "aws_iam_policy" "ecs-task-role-policy" {
       {
         "Effect" : "Allow",
         "Action" : [
-          "s3:ListBucket"
+          "*"
         ],
         "Resource" : "*"
       }
@@ -351,7 +369,7 @@ resource "aws_iam_policy" "ecs-task-role-policy" {
 }
 
 
-resource "aws_iam_role_policy_attachment" "ecs-task-role-policy-attachment" {
-  role       = aws_iam_role.ecs-task-role.name
-  policy_arn = aws_iam_policy.ecs-task-role-policy.arn
+resource "aws_iam_role_policy_attachment" "ecs_task_role-policy_attachment" {
+  role       = aws_iam_role.ecs_task_role.name
+  policy_arn = aws_iam_policy.ecs_task_role_policy.arn
 }
